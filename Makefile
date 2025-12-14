@@ -23,6 +23,8 @@ else
   BUILD = -s
 endif
 
+LIBS += -lnfnetlink -lnetfilter_queue
+
 %.o: %.c
 	$(CC) $(CFLAGS) -c $<
 

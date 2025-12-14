@@ -29,6 +29,16 @@ URL: https://www.github.com/KuzinAndrey/kavsprayvpn
 #include <linux/if_tun.h>
 #include <arpa/inet.h>
 
+#include <inttypes.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netinet/ip.h>
+// #include <netinet/ip6.h>
+#include <netinet/udp.h>
+#include <linux/netfilter.h>
+#include <libnfnetlink/libnfnetlink.h>
+#include <libnetfilter_queue/libnetfilter_queue.h>
+
 #ifndef PRODUCTION
 #include <sys/resource.h>
 #define TRACE fprintf(stderr,"TRACE %s:%d - %s()\n", __FILE__, __LINE__, __func__);
@@ -42,6 +52,11 @@ URL: https://www.github.com/KuzinAndrey/kavsprayvpn
 
 int program_state = 0; // 2 - exit
 int run_command(const char *fmt, ...);
+
+
+// Spray port diapazon
+uint16_t opt_start_port = 1;
+uint16_t opt_end_port = 65535;
 
 ///////////////////////////////////////////////////////
 //////// TUN
@@ -182,6 +197,95 @@ defer:
 	return ret;
 } // run_command()
 
+///////////////////////////////////////////////////////
+//////// NETFILTER
+///////////////////////////////////////////////////////
+
+// Callback function for NFQUEUE handler
+static int vpn_nfq_callback(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
+	struct nfq_data *nfa, void *data) {
+
+	int ret;
+	uint32_t id;
+	struct nfqnl_msg_packet_hdr *ph;
+	unsigned char *payload;
+	size_t payload_len;
+#ifndef PRODUCTION
+	struct timeval nfq_tv;
+	char ipaddr[128];
+#endif
+
+	struct ip *ip_packet;
+	uint16_t ip_packet_len;
+	struct in_addr in = {0};
+
+	struct udphdr *udp_packet = NULL;
+	uint16_t udp_port;
+	int found_sess = 0;
+
+	ph = nfq_get_msg_packet_hdr(nfa);
+	id = ntohl(ph->packet_id);
+
+#ifndef PRODUCTION
+	if (0 != nfq_get_timestamp(nfa, &nfq_tv)) {
+		nfq_tv.tv_sec = time(NULL);
+		nfq_tv.tv_usec = 0;
+	}
+#endif
+
+	ret = nfq_get_payload(nfa, &payload);
+	if (ret <= 0 || !payload) goto verdict;
+	payload_len = ret;
+
+	if (payload_len < sizeof(struct ip)) goto verdict;
+
+	ip_packet = (struct ip *)payload;
+
+	// Detect IP protocol version
+	if (4 == ip_packet->ip_v) {
+		// IPv4
+		size_t ip_hl;
+		in = ip_packet->ip_src;
+		ip_hl = ip_packet->ip_hl * 4;
+		ip_packet_len = ntohs(ip_packet->ip_len);
+		if (IPPROTO_UDP == ip_packet->ip_p
+			&& ip_packet_len > ip_hl + sizeof(struct udphdr)
+		) {
+			udp_packet = (struct udphdr *)(payload + ip_hl);
+		}
+
+#ifndef PRODUCTION
+		inet_ntop(AF_INET, &ip_packet->ip_src, ipaddr, sizeof(ipaddr));
+#endif
+//	} else if (6 == ip_packet->ip_v) {
+//		// TODO IPv6
+	}
+
+	if (!udp_packet) goto verdict;
+	udp_port = ntohs(udp_packet->uh_dport);
+
+	DEBUG("%ld: get UDP packet on port %" PRIu16 " from %s\n",
+		nfq_tv.tv_sec, udp_port, ipaddr);
+ 
+	if (udp_port < opt_start_port || udp_port > opt_end_port) goto verdict;
+
+	DYNAMIC_ARRAY_FOREACH(sess, i, {
+		if (sess.data[i].remote_ip.s_addr == in.s_addr) {
+			found_sess = i;
+			break;
+		}
+	});
+
+	if (!found_sess) goto verdict;
+
+	DEBUG("%ld: found session %d\n", found_sess);
+
+	// TODO work with packet
+
+verdict:
+	return nfq_set_verdict(qh, id, NF_DROP, 0, NULL);
+}
+
 
 ///////////////////////////////////////////////////////
 //////// MAIN
@@ -195,6 +299,25 @@ int main(int argc, char **argv) {
 	struct in_addr tun_ptp_subnet;
 	struct in_addr local_ptp_ip;
 	struct in_addr remote_ptp_ip;
+
+
+	// NFQUEUE variables
+	char netfilter_buf[0xFFFF] = {0};
+	uint16_t opt_queue_id = 69;
+	uint32_t opt_queue_maxlen = 10000;
+	int opt_touch_iptables = 1;
+	int iptables_create_rule = 0;
+
+	// Netfilter
+	struct nfq_handle *netfilter_h = NULL;
+	struct nfnl_handle *netfilter_nh = NULL;
+	struct nfq_q_handle *netfilter_qh = NULL;
+	int netfilter_fd;
+	int netfilter_rv;
+
+	fd_set rfds;
+	struct timeval rfds_tv;
+
 	char *optarg;
 
 	enum work_mode_en {
@@ -222,6 +345,9 @@ int main(int argc, char **argv) {
 		return 1;
 	};
 	work_mode = WORK_MODE_CLIENT;
+
+	opt_start_port = 40123;
+	opt_end_port = 53412;
 /////////////////////////
 
 	// Prepare tun variables
@@ -259,17 +385,92 @@ int main(int argc, char **argv) {
 		inet_ntoa(local_ptp_ip), conn.tun_name)
 	) {
 		fprintf(stderr, "error set ip address on tun iface\n");
+		ret = 1;
 		goto exit_tun_link;
 	};
 
+#define IPTABLES_NFQUEUE_TEMPLATE \
+	"%s -%s INPUT -p udp --dport %d:%d " \
+	"-j NFQUEUE --queue-bypass --queue-num %d 2> /dev/null"
+
+	// Add iptables rule if it not present
+	if (opt_touch_iptables && iptables_bin) {
+		if (0 != run_command(IPTABLES_NFQUEUE_TEMPLATE, iptables_bin, "C",
+				     opt_start_port, opt_end_port, opt_queue_id)
+		) {
+			if (0 != run_command(IPTABLES_NFQUEUE_TEMPLATE, iptables_bin, "I",
+					     opt_start_port, opt_end_port, opt_queue_id)) {
+				fprintf(stderr, "Error: Cannot create iptables rule\n");
+				ret = 1;
+				goto exit_tun_ip;
+			} else iptables_create_rule = 1;
+		}
+	}
+
+	// Prepare Netfilter Queue library
+	netfilter_h = nfq_open();
+	if (!netfilter_h) {
+		fprintf(stderr, "Error: Cannot open NFQUEUE handle\n");
+		ret = 1; goto exit;
+	}
+
+	netfilter_nh = nfq_nfnlh(netfilter_h);
+	netfilter_fd = nfnl_fd(netfilter_nh);
+
+	netfilter_qh = nfq_create_queue(netfilter_h, opt_queue_id, &vpn_nfq_callback, NULL);
+	if (!netfilter_qh) {
+		fprintf(stderr, "Error: Cannot create NFQUEUE %" PRIu16 "\n", opt_queue_id);
+		ret = 1; goto exit;
+	}
+
+	if (nfq_set_queue_maxlen(netfilter_qh, opt_queue_maxlen) < 0) {
+		fprintf(stderr, "Warning: Cannot set queue maxlen to %" PRIu32 "\n", opt_queue_maxlen);
+	}
+
+	// Accept all packets if queue is full (not drop it)
+	if (nfq_set_queue_flags(netfilter_qh, NFQA_CFG_F_FAIL_OPEN, NFQA_CFG_F_FAIL_OPEN) < 0) {
+		fprintf(stderr, "Warning: Cannot set fail-open flag\n");
+	}
+
+	// Copy full packet
+	if (nfq_set_mode(netfilter_qh, NFQNL_COPY_PACKET, sizeof(netfilter_buf)) < 0) {
+		fprintf(stderr, "Error: Cannot set packet copy mode\n");
+		ret = 1; goto exit;
+	}
+
 	// Main work cycle
 	while (0 != access("./.break", F_OK)) {
+		// Get NFQUEUE packet for work
+		rfds_tv.tv_sec = 1; rfds_tv.tv_usec = 0;
+		FD_ZERO(&rfds);
+		FD_SET(netfilter_fd,&rfds);
+		if (select(netfilter_fd + 1, &rfds, NULL, NULL, &rfds_tv) > 0) {
+			if (FD_ISSET(netfilter_fd, &rfds)) {
+				netfilter_rv = recv(netfilter_fd, netfilter_buf, sizeof(netfilter_buf), 0);
+				if (netfilter_rv >= 0) {
+					nfq_handle_packet(netfilter_h, netfilter_buf, netfilter_rv);
+				};
+			}
+		}
+
 		printf("working\n");
 		sleep(10);
 	}
 	unlink("./.break");
 
-//exit_tun_ip:
+exit:
+	if (netfilter_qh) nfq_destroy_queue(netfilter_qh);
+	if (netfilter_h) nfq_close(netfilter_h);
+
+	if (iptables_create_rule && iptables_bin) {
+		if (0 != run_command(IPTABLES_NFQUEUE_TEMPLATE, iptables_bin, "D",
+				     opt_start_port, opt_end_port, opt_queue_id)
+		) {
+			fprintf(stderr, "Error: Cannot delete iptables rule\n");
+		}
+	}
+
+exit_tun_ip:
 	run_command("%s address del %s/24 dev %s", ip_bin,
 		inet_ntoa(local_ptp_ip), conn.tun_name);
 
