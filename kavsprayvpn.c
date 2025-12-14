@@ -57,6 +57,7 @@ int run_command(const char *fmt, ...);
 // Spray port diapazon
 uint16_t opt_start_port = 1;
 uint16_t opt_end_port = 65535;
+uint16_t diapazon = 65534;
 
 ///////////////////////////////////////////////////////
 //////// TUN
@@ -125,7 +126,6 @@ struct spray_session {
 		STATE_WORK,
 	} state;
 };
-
 
 const char *iptables_bin = NULL;
 const char *iptables_search[] = {
@@ -255,7 +255,7 @@ static int vpn_nfq_callback(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 		}
 
 #ifndef PRODUCTION
-		inet_ntop(AF_INET, &ip_packet->ip_src, ipaddr, sizeof(ipaddr));
+		inet_ntop(AF_INET, &in, ipaddr, sizeof(ipaddr));
 #endif
 //	} else if (6 == ip_packet->ip_v) {
 //		// TODO IPv6
@@ -286,13 +286,63 @@ verdict:
 	return nfq_set_verdict(qh, id, NF_DROP, 0, NULL);
 }
 
+// Function for tun packet work
+static ssize_t tun_handle_packet(int sock_fd, char *buf, size_t buf_len) {
+	struct ip *ip_packet;
+//	uint16_t ip_packet_len;
+	struct sockaddr_in dest = {0};
+	ssize_t n = 0;
+	int session = -1;
+#ifndef PRODUCTION
+	char ipaddr1[128];
+	char ipaddr2[128];
+#endif
+
+//	struct udphdr *udp_packet = NULL;
+//	uint16_t udp_port;
+
+	// TODO find session by remote ip
+	if (sess.count > 0) session = 0;
+
+	if (session < 0) return 0;
+	ip_packet = (struct ip *)buf;
+
+	if (4 == ip_packet->ip_v) {
+//		ip_packet_len = ntohs(ip_packet->ip_len);
+#ifndef PRODUCTION
+		if (inet_ntop(AF_INET, &ip_packet->ip_src, ipaddr1, sizeof(ipaddr1))
+		    && inet_ntop(AF_INET, &ip_packet->ip_dst, ipaddr2, sizeof(ipaddr2))
+		) {
+			DEBUG("recv packet %s -> %s, len %d\n", ipaddr1, ipaddr2, ip_packet_len);
+		}
+#endif
+		dest.sin_family = AF_INET;
+		dest.sin_port = htons(opt_start_port + rand() % diapazon);
+		dest.sin_addr = sess.data[session].remote_ip;
+		n = sendto(sock_fd, buf, buf_len, 0, (struct sockaddr *)&dest, sizeof(dest));
+		if (n < 0) {
+			DEBUG("Failed sendto");
+		}
+		DEBUG("sendto = %ld\n", n);
+	}
+	return n;
+}
+
+void signal_handler(int sig) {
+	switch (sig) {
+		case SIGINT:
+		case SIGTERM:
+			program_state = 2; //exit main cycle
+		break;
+	} // swtich
+} // signal_handler()
+
 
 ///////////////////////////////////////////////////////
 //////// MAIN
 ///////////////////////////////////////////////////////
 int main(int argc, char **argv) {
 	int ret = 0;
-	char tun_buffer[0xFFFF] = {0};
 	struct tun_connection conn = {0};
 	int tun_number = 1;
 	char opt_tun_iface[IFNAMSIZ];
@@ -300,9 +350,7 @@ int main(int argc, char **argv) {
 	struct in_addr local_ptp_ip;
 	struct in_addr remote_ptp_ip;
 
-
 	// NFQUEUE variables
-	char netfilter_buf[0xFFFF] = {0};
 	uint16_t opt_queue_id = 69;
 	uint32_t opt_queue_maxlen = 10000;
 	int opt_touch_iptables = 1;
@@ -313,10 +361,13 @@ int main(int argc, char **argv) {
 	struct nfnl_handle *netfilter_nh = NULL;
 	struct nfq_q_handle *netfilter_qh = NULL;
 	int netfilter_fd;
-	int netfilter_rv;
 
 	fd_set rfds;
 	struct timeval rfds_tv;
+
+	char recv_buffer[0xFFFF] = {0};
+	ssize_t recv_len;
+	int udp_fd = -1;
 
 	char *optarg;
 
@@ -336,6 +387,11 @@ int main(int argc, char **argv) {
 
 	if (!find_commands()) return 1;
 
+	if ((udp_fd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+		fprintf(stderr, "UDP socket creation error\n");
+		return 1;
+	}
+
 /////////////////////////
 // TODO parse options
 	optarg = "10.66.77.0";
@@ -348,13 +404,25 @@ int main(int argc, char **argv) {
 
 	opt_start_port = 40123;
 	opt_end_port = 53412;
+	diapazon = opt_end_port - opt_start_port;
+
+	optarg = "10.168.1.26";
+	struct spray_session new = {0};
+	if (!inet_pton(AF_INET, optarg, &new.remote_ip)) {
+		fprintf(stderr, "Can't parse \"%s\" remote IP\n", optarg);
+		return 1;
+	}
+	optarg = "remotesecret";
+	snprintf(new.secret, sizeof(new.secret), "%s", optarg);
+	DYNAMIC_ARRAY_PUSH(sess, new);
+
 /////////////////////////
 
 	// Prepare tun variables
 	// TODO use opt_tun_iface if defined and check it
 	while (1) { // find empty name for tun device
-		sprintf(tun_buffer, "/proc/sys/net/ipv4/conf/tun%d", tun_number);
-		if (access(tun_buffer, F_OK) == -1) break;
+		sprintf(recv_buffer, "/proc/sys/net/ipv4/conf/tun%d", tun_number);
+		if (access(recv_buffer, F_OK) == -1) break;
 		tun_number++;
 	}; // while
 	sprintf(opt_tun_iface, "tun%d", tun_number);
@@ -433,30 +501,39 @@ int main(int argc, char **argv) {
 	}
 
 	// Copy full packet
-	if (nfq_set_mode(netfilter_qh, NFQNL_COPY_PACKET, sizeof(netfilter_buf)) < 0) {
+	if (nfq_set_mode(netfilter_qh, NFQNL_COPY_PACKET, sizeof(recv_buffer)) < 0) {
 		fprintf(stderr, "Error: Cannot set packet copy mode\n");
 		ret = 1; goto exit;
 	}
 
+	signal(SIGINT, signal_handler);
+	signal(SIGTERM, signal_handler);
+
 	// Main work cycle
-	while (0 != access("./.break", F_OK)) {
+	while (2 != program_state) {
 		// Get NFQUEUE packet for work
+		int max_fd = 0;
 		rfds_tv.tv_sec = 1; rfds_tv.tv_usec = 0;
 		FD_ZERO(&rfds);
 		FD_SET(netfilter_fd,&rfds);
-		if (select(netfilter_fd + 1, &rfds, NULL, NULL, &rfds_tv) > 0) {
+		max_fd = netfilter_fd;
+		FD_SET(conn.tun_fd,&rfds);
+		if (max_fd < conn.tun_fd) max_fd = conn.tun_fd;
+		if (select(max_fd + 1, &rfds, NULL, NULL, &rfds_tv) > 0) {
 			if (FD_ISSET(netfilter_fd, &rfds)) {
-				netfilter_rv = recv(netfilter_fd, netfilter_buf, sizeof(netfilter_buf), 0);
-				if (netfilter_rv >= 0) {
-					nfq_handle_packet(netfilter_h, netfilter_buf, netfilter_rv);
-				};
+				recv_len = recv(netfilter_fd, recv_buffer, sizeof(recv_buffer), 0);
+				if (recv_len >= 0) {
+					nfq_handle_packet(netfilter_h, recv_buffer, recv_len);
+				}
+			}
+			if (FD_ISSET(conn.tun_fd, &rfds)) {
+				recv_len = recv(conn.tun_fd, recv_buffer, sizeof(recv_buffer), 0);
+				if (recv_len >= 0) {
+					tun_handle_packet(udp_fd, recv_buffer, recv_len);
+				}
 			}
 		}
-
-		printf("working\n");
-		sleep(10);
 	}
-	unlink("./.break");
 
 exit:
 	if (netfilter_qh) nfq_destroy_queue(netfilter_qh);
@@ -478,6 +555,7 @@ exit_tun_link:
 	run_command("%s link set %s down", ip_bin, conn.tun_name);
 
 exit_tun:
+	if (udp_fd > 0) close(udp_fd);
 	down_tun_iface(&conn);
 	DYNAMIC_ARRAY_FREE(sess);
 	return ret;
