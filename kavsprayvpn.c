@@ -24,6 +24,7 @@ URL: https://www.github.com/KuzinAndrey/kavsprayvpn
 #include <fcntl.h>
 #include <errno.h>
 #include <syslog.h>
+#include <time.h>
 
 #include <net/if.h>
 #include <linux/if_tun.h>
@@ -49,7 +50,6 @@ URL: https://www.github.com/KuzinAndrey/kavsprayvpn
 #endif
 
 #include "dynamic_array.h"
-
 int program_state = 0; // 2 - exit
 int run_command(const char *fmt, ...);
 
@@ -111,6 +111,13 @@ int down_tun_iface(struct tun_connection *conn) {
 	}
 	return ret;
 } // down_tun_iface()
+
+static struct tun_connection conn = {0};
+static int tun_number = 1;
+static char opt_tun_iface[IFNAMSIZ];
+static struct in_addr tun_ptp_subnet;
+static struct in_addr local_ptp_ip;
+static struct in_addr remote_ptp_ip;
 
 ///////////////////////////////////////////////////////
 //////// SESSIONS
@@ -220,8 +227,9 @@ static int vpn_nfq_callback(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 	struct in_addr in = {0};
 
 	struct udphdr *udp_packet = NULL;
-	uint16_t udp_port;
-	int found_sess = 0;
+	uint16_t udp_port = 0;
+	uint16_t udp_packet_len = 0;
+	int found_sess = -1;
 
 	ph = nfq_get_msg_packet_hdr(nfa);
 	id = ntohl(ph->packet_id);
@@ -241,6 +249,7 @@ static int vpn_nfq_callback(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 
 	ip_packet = (struct ip *)payload;
 
+
 	// Detect IP protocol version
 	if (4 == ip_packet->ip_v) {
 		// IPv4
@@ -249,9 +258,11 @@ static int vpn_nfq_callback(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 		ip_hl = ip_packet->ip_hl * 4;
 		ip_packet_len = ntohs(ip_packet->ip_len);
 		if (IPPROTO_UDP == ip_packet->ip_p
-			&& ip_packet_len > ip_hl + sizeof(struct udphdr)
+			&& ip_packet_len >= ip_hl + sizeof(struct udphdr)
 		) {
 			udp_packet = (struct udphdr *)(payload + ip_hl);
+			udp_port = ntohs(udp_packet->uh_dport);
+			udp_packet_len = ntohs(udp_packet->uh_ulen);
 		}
 
 #ifndef PRODUCTION
@@ -262,28 +273,32 @@ static int vpn_nfq_callback(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 	}
 
 	if (!udp_packet) goto verdict;
-	udp_port = ntohs(udp_packet->uh_dport);
 
-	DEBUG("%ld: get UDP packet on port %" PRIu16 " from %s\n",
-		nfq_tv.tv_sec, udp_port, ipaddr);
- 
 	if (udp_port < opt_start_port || udp_port > opt_end_port) goto verdict;
 
 	DYNAMIC_ARRAY_FOREACH(sess, i, {
 		if (sess.data[i].remote_ip.s_addr == in.s_addr) {
+			DEBUG("%ld: found session %d\n", nfq_tv.tv_sec, found_sess);
 			found_sess = i;
 			break;
 		}
 	});
 
-	if (!found_sess) goto verdict;
+	if (found_sess < 0) {
+		goto verdict;
+	}
 
-	DEBUG("%ld: found session %d\n", found_sess);
+	DEBUG("%ld: get UDP packet on port %" PRIu16 " from %s (UDP length %d) IP len %d\n",
+		nfq_tv.tv_sec, udp_port, ipaddr, udp_packet_len, ip_packet_len);
 
 	// TODO work with packet
 
-verdict:
+	write(conn.tun_fd, (char *)(udp_packet) + sizeof(struct udphdr), udp_packet_len - sizeof(struct udphdr));
+
 	return nfq_set_verdict(qh, id, NF_DROP, 0, NULL);
+
+verdict:
+	return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
 }
 
 // Function for tun packet work
@@ -313,7 +328,7 @@ static ssize_t tun_handle_packet(int sock_fd, char *buf, size_t buf_len) {
 		if (inet_ntop(AF_INET, &ip_packet->ip_src, ipaddr1, sizeof(ipaddr1))
 		    && inet_ntop(AF_INET, &ip_packet->ip_dst, ipaddr2, sizeof(ipaddr2))
 		) {
-			DEBUG("recv packet %s -> %s, len %d\n", ipaddr1, ipaddr2, ip_packet_len);
+			DEBUG("recv packet %s -> %s, len %d\n", ipaddr1, ipaddr2, ntohs(ip_packet->ip_len));
 		}
 #endif
 		dest.sin_family = AF_INET;
@@ -323,7 +338,6 @@ static ssize_t tun_handle_packet(int sock_fd, char *buf, size_t buf_len) {
 		if (n < 0) {
 			DEBUG("Failed sendto");
 		}
-		DEBUG("sendto = %ld\n", n);
 	}
 	return n;
 }
@@ -343,12 +357,6 @@ void signal_handler(int sig) {
 ///////////////////////////////////////////////////////
 int main(int argc, char **argv) {
 	int ret = 0;
-	struct tun_connection conn = {0};
-	int tun_number = 1;
-	char opt_tun_iface[IFNAMSIZ];
-	struct in_addr tun_ptp_subnet;
-	struct in_addr local_ptp_ip;
-	struct in_addr remote_ptp_ip;
 
 	// NFQUEUE variables
 	uint16_t opt_queue_id = 69;
@@ -516,9 +524,8 @@ int main(int argc, char **argv) {
 		rfds_tv.tv_sec = 1; rfds_tv.tv_usec = 0;
 		FD_ZERO(&rfds);
 		FD_SET(netfilter_fd,&rfds);
-		max_fd = netfilter_fd;
 		FD_SET(conn.tun_fd,&rfds);
-		if (max_fd < conn.tun_fd) max_fd = conn.tun_fd;
+		max_fd = (netfilter_fd > conn.tun_fd ? netfilter_fd : conn.tun_fd);
 		if (select(max_fd + 1, &rfds, NULL, NULL, &rfds_tv) > 0) {
 			if (FD_ISSET(netfilter_fd, &rfds)) {
 				recv_len = recv(netfilter_fd, recv_buffer, sizeof(recv_buffer), 0);
@@ -527,7 +534,7 @@ int main(int argc, char **argv) {
 				}
 			}
 			if (FD_ISSET(conn.tun_fd, &rfds)) {
-				recv_len = recv(conn.tun_fd, recv_buffer, sizeof(recv_buffer), 0);
+				recv_len = read(conn.tun_fd, recv_buffer, sizeof(recv_buffer));
 				if (recv_len >= 0) {
 					tun_handle_packet(udp_fd, recv_buffer, recv_len);
 				}
