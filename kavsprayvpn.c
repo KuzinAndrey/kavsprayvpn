@@ -61,6 +61,7 @@ int run_command(const char *fmt, ...);
 uint16_t opt_start_port = 1;
 uint16_t opt_end_port = 65535;
 uint16_t diapazon = 65534;
+size_t opt_change_port = 1000;
 
 static char recv_buffer[0xFFFF] = {0};
 static char crypto_buffer[0xFFFF + 128] = {0};
@@ -481,6 +482,7 @@ int main(int argc, char **argv) {
 	struct timeval rfds_tv;
 
 	int udp_fd = -1;
+	size_t udp_count = 0;
 
 	char *optarg;
 
@@ -645,8 +647,16 @@ int main(int argc, char **argv) {
 				recv_len = read(conn.tun_fd, recv_buffer, sizeof(recv_buffer));
 				if (recv_len >= 0) {
 					tun_handle_packet(udp_fd, recv_buffer, recv_len);
+					udp_count++;
 				}
 			}
+		}
+		// Change outgoing UDP port every opt_change_port packets
+		if (udp_count > opt_change_port) {
+			close(udp_fd);
+			if ((udp_fd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+				goto exit;
+			} else udp_count = 0;
 		}
 	}
 
