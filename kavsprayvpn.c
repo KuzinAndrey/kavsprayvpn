@@ -39,6 +39,7 @@ URL: https://www.github.com/KuzinAndrey/kavsprayvpn
 #include <linux/netfilter.h>
 #include <libnfnetlink/libnfnetlink.h>
 #include <libnetfilter_queue/libnetfilter_queue.h>
+#include <openssl/evp.h>
 
 #ifndef PRODUCTION
 #include <sys/resource.h>
@@ -50,6 +51,8 @@ URL: https://www.github.com/KuzinAndrey/kavsprayvpn
 #endif
 
 #include "dynamic_array.h"
+#include "crypto.h"
+
 int program_state = 0; // 2 - exit
 int run_command(const char *fmt, ...);
 
@@ -58,6 +61,10 @@ int run_command(const char *fmt, ...);
 uint16_t opt_start_port = 1;
 uint16_t opt_end_port = 65535;
 uint16_t diapazon = 65534;
+
+static char recv_buffer[0xFFFF] = {0};
+static char crypto_buffer[0xFFFF + 128] = {0};
+static EVP_CIPHER_CTX *ctx = NULL;
 
 ///////////////////////////////////////////////////////
 //////// TUN
@@ -205,6 +212,96 @@ defer:
 } // run_command()
 
 ///////////////////////////////////////////////////////
+//////// ENCRYPTION
+///////////////////////////////////////////////////////
+// Get portion of key data from built-in crypto array (see crypto.h)
+void get_crypto_array_part(size_t pos, void *buf, size_t buf_size) {
+	memcpy(buf, (char *)crypto_h_array + pos %
+		(CRYPTO_H_ARRAY_SIZE - buf_size + 1), buf_size);
+}
+
+
+// Encrypt data buffer by random key & iv from global crypto array
+int encrypt_data(EVP_CIPHER_CTX *ctx, const char *data, size_t data_len,
+	char *outdata, size_t *outdata_len)
+{
+	int key_pos = rand();
+	int iv_pos = rand();
+	unsigned char key[32];
+	unsigned char iv[16];
+	unsigned char *p = (unsigned char*)outdata;
+	size_t s = 0;
+	int len;
+
+	if (!ctx || !data || !outdata || !outdata_len) return -1;
+	*outdata_len = 0;
+
+	get_crypto_array_part(key_pos, key, sizeof(key));
+	get_crypto_array_part(iv_pos, iv, sizeof(iv));
+
+	memcpy(p, &key_pos, sizeof(key_pos));
+	s += sizeof(key_pos);
+
+	memcpy(p + s, &iv_pos, sizeof(iv_pos));
+	s += sizeof(iv_pos);
+
+	if (1 != EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv)) goto error;
+
+	if (1 != EVP_EncryptUpdate(ctx, p + s, &len, (unsigned char *)data, data_len)) goto error;
+	s += len;
+
+	if (1 != EVP_EncryptFinal_ex(ctx, p + s, &len)) goto error;
+	s += len;
+
+	*outdata_len = s;
+	return 0;
+
+error:
+	*outdata_len = 0;
+	return -1;
+}
+
+// Decrypt data buffer by key & iv position from global crypto array
+int decrypt_data(EVP_CIPHER_CTX *ctx, const char *data, size_t data_len,
+	char *outdata, size_t *outdata_len)
+{
+	int key_pos = rand();
+	int iv_pos = rand();
+	unsigned char key[32];
+	unsigned char iv[16];
+	unsigned char *p = (unsigned char*)outdata;
+	size_t s = 0;
+	int len;
+
+	if (!ctx || !data || !outdata || !outdata_len) return -1;
+	*outdata_len = 0;
+
+	memcpy(&key_pos, data, sizeof(key_pos));
+	s += sizeof(key_pos);
+
+	memcpy(&iv_pos, data + s, sizeof(iv_pos));
+	s += sizeof(iv_pos);
+
+	get_crypto_array_part(key_pos, key, sizeof(key));
+	get_crypto_array_part(iv_pos, iv, sizeof(iv));
+
+	if (1 != EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv)) goto error;
+
+	if (1 != EVP_DecryptUpdate(ctx, p, &len, (unsigned char *)data + s, data_len - s)) goto error;
+	s = len;
+
+	if (1 != EVP_DecryptFinal_ex(ctx, p + s, &len)) goto error;
+	s += len;
+
+	*outdata_len = s;
+	return 0;
+
+error:
+	*outdata_len = 0;
+	return -1;
+}
+
+///////////////////////////////////////////////////////
 //////// NETFILTER
 ///////////////////////////////////////////////////////
 
@@ -291,9 +388,11 @@ static int vpn_nfq_callback(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 	DEBUG("%ld: get UDP packet on port %" PRIu16 " from %s (UDP length %d) IP len %d\n",
 		nfq_tv.tv_sec, udp_port, ipaddr, udp_packet_len, ip_packet_len);
 
-	// TODO work with packet
+	if (decrypt_data(ctx, (char *)(udp_packet) + sizeof(struct udphdr),
+		udp_packet_len - sizeof(struct udphdr),
+		crypto_buffer, &payload_len) < 0) goto verdict;
 
-	write(conn.tun_fd, (char *)(udp_packet) + sizeof(struct udphdr), udp_packet_len - sizeof(struct udphdr));
+	write(conn.tun_fd, crypto_buffer, payload_len);
 
 	return nfq_set_verdict(qh, id, NF_DROP, 0, NULL);
 
@@ -307,6 +406,7 @@ static ssize_t tun_handle_packet(int sock_fd, char *buf, size_t buf_len) {
 //	uint16_t ip_packet_len;
 	struct sockaddr_in dest = {0};
 	ssize_t n = 0;
+	size_t payload_len = 0;
 	int session = -1;
 #ifndef PRODUCTION
 	char ipaddr1[128];
@@ -334,11 +434,18 @@ static ssize_t tun_handle_packet(int sock_fd, char *buf, size_t buf_len) {
 		dest.sin_family = AF_INET;
 		dest.sin_port = htons(opt_start_port + rand() % diapazon);
 		dest.sin_addr = sess.data[session].remote_ip;
-		n = sendto(sock_fd, buf, buf_len, 0, (struct sockaddr *)&dest, sizeof(dest));
+
+		if (encrypt_data(ctx, buf, buf_len, crypto_buffer, &payload_len) < 0) {
+			n = -1;
+			goto exit;
+		}
+
+		n = sendto(sock_fd, crypto_buffer, payload_len, 0, (struct sockaddr *)&dest, sizeof(dest));
 		if (n < 0) {
 			DEBUG("Failed sendto");
 		}
 	}
+exit:
 	return n;
 }
 
@@ -373,8 +480,6 @@ int main(int argc, char **argv) {
 	fd_set rfds;
 	struct timeval rfds_tv;
 
-	char recv_buffer[0xFFFF] = {0};
-	ssize_t recv_len;
 	int udp_fd = -1;
 
 	char *optarg;
@@ -392,6 +497,8 @@ int main(int argc, char **argv) {
 			"Use: sudo %s\n", argv[0]);
 		return 1;
 	}
+
+	if (!(ctx = EVP_CIPHER_CTX_new())) return 1;
 
 	if (!find_commands()) return 1;
 
@@ -521,6 +628,7 @@ int main(int argc, char **argv) {
 	while (2 != program_state) {
 		// Get NFQUEUE packet for work
 		int max_fd = 0;
+		ssize_t recv_len;
 		rfds_tv.tv_sec = 1; rfds_tv.tv_usec = 0;
 		FD_ZERO(&rfds);
 		FD_SET(netfilter_fd,&rfds);
@@ -564,6 +672,7 @@ exit_tun_link:
 exit_tun:
 	if (udp_fd > 0) close(udp_fd);
 	down_tun_iface(&conn);
+	if (ctx) EVP_CIPHER_CTX_free(ctx);
 	DYNAMIC_ARRAY_FREE(sess);
 	return ret;
 }

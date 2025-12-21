@@ -24,6 +24,7 @@ else
 endif
 
 LIBS += -lnfnetlink -lnetfilter_queue
+LIBS += -lcrypto
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $<
