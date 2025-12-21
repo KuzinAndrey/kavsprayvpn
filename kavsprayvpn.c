@@ -592,6 +592,13 @@ int main(int argc, char **argv) {
 		}
 	}
 
+#ifdef PRODUCTION
+	if (daemon(0, 0) != 0) {
+		fprintf(stderr,"Can't daemonize process!\n");
+		goto exit;
+	};
+#endif
+
 	// Prepare Netfilter Queue library
 	netfilter_h = nfq_open();
 	if (!netfilter_h) {
