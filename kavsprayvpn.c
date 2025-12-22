@@ -459,6 +459,7 @@ void signal_handler(int sig) {
 	} // swtich
 } // signal_handler()
 
+#define UDP_OUTPORT_SIZE 128
 
 ///////////////////////////////////////////////////////
 //////// MAIN
@@ -481,8 +482,8 @@ int main(int argc, char **argv) {
 	fd_set rfds;
 	struct timeval rfds_tv;
 
-	int udp_fd = -1;
-	size_t udp_count = 0;
+	int udp_fd[UDP_OUTPORT_SIZE];
+	size_t udp_count[UDP_OUTPORT_SIZE];
 
 	char *optarg;
 
@@ -504,9 +505,12 @@ int main(int argc, char **argv) {
 
 	if (!find_commands()) return 1;
 
-	if ((udp_fd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
-		fprintf(stderr, "UDP socket creation error\n");
-		return 1;
+	for (size_t i = 0; i < UDP_OUTPORT_SIZE; i++) {
+		if ((udp_fd[i] = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+			fprintf(stderr, "UDP socket creation error\n");
+			return 1;
+		}
+		udp_count[i] = 0;
 	}
 
 /////////////////////////
@@ -653,17 +657,19 @@ int main(int argc, char **argv) {
 			if (FD_ISSET(conn.tun_fd, &rfds)) {
 				recv_len = read(conn.tun_fd, recv_buffer, sizeof(recv_buffer));
 				if (recv_len >= 0) {
-					tun_handle_packet(udp_fd, recv_buffer, recv_len);
-					udp_count++;
+					size_t rand_port = rand() % UDP_OUTPORT_SIZE;
+					tun_handle_packet(udp_fd[rand_port], recv_buffer, recv_len);
+					udp_count[rand_port]++;
+
+					// Change outgoing UDP port every opt_change_port packets
+					if (udp_count[rand_port] > opt_change_port) {
+						close(udp_fd[rand_port]);
+						if ((udp_fd[rand_port] = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+							goto exit;
+						} else udp_count[rand_port] = 0;
+					}
 				}
 			}
-		}
-		// Change outgoing UDP port every opt_change_port packets
-		if (udp_count > opt_change_port) {
-			close(udp_fd);
-			if ((udp_fd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
-				goto exit;
-			} else udp_count = 0;
 		}
 	}
 
@@ -687,7 +693,9 @@ exit_tun_link:
 	run_command("%s link set %s down", ip_bin, conn.tun_name);
 
 exit_tun:
-	if (udp_fd > 0) close(udp_fd);
+	for (size_t i = 0; i < UDP_OUTPORT_SIZE; i++) {
+		if (udp_fd[i] > 0) close(udp_fd[i]);
+	}
 	down_tun_iface(&conn);
 	if (ctx) EVP_CIPHER_CTX_free(ctx);
 	DYNAMIC_ARRAY_FREE(sess);
