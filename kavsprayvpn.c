@@ -58,10 +58,11 @@ int run_command(const char *fmt, ...);
 
 
 // Spray port diapazon
-uint16_t opt_start_port = 1;
+uint16_t opt_start_port = 1025;
 uint16_t opt_end_port = 65535;
-uint16_t diapazon = 65534;
+uint16_t diapazon = 64510; // end - start
 size_t opt_change_port = 1000;
+int opt_subnet_prefix = 24;
 
 static char recv_buffer[0xFFFF] = {0};
 static char crypto_buffer[0xFFFF + 128] = {0};
@@ -126,6 +127,7 @@ static char opt_tun_iface[IFNAMSIZ];
 static struct in_addr tun_ptp_subnet;
 static struct in_addr local_ptp_ip;
 static struct in_addr remote_ptp_ip;
+static int opt_tun_ptp_subnet = 0;
 
 ///////////////////////////////////////////////////////
 //////// SESSIONS
@@ -459,13 +461,39 @@ void signal_handler(int sig) {
 	} // swtich
 } // signal_handler()
 
+
 #define UDP_OUTPORT_SIZE 128
+
+void print_help(const char *prog) {
+	printf("Spray VPN daemon (home: https://github.com/KuzinAndrey/kavsprayvnp)\n");
+	printf("\n");
+	printf("Usage: %s [options]\n", prog);
+	printf("Options:\n");
+	printf("\t-h - this help\n");
+	printf("\t-s - work as server side (run iptables with NAT & FORWARD rules)\n");
+	printf("\t-c - work as client size\n");
+	printf("\t-a [port] - start UDP port diapazon\n");
+	printf("\t-b [port] - end UDP port diapazon\n");
+	printf("\t-n [subnet] - P-t-P subnet to set IP on tun iface (can be prefixed by /NN)\n");
+	printf("\t     Example: 10.66.77.0 (or 10.66.77.0/30 or 10.66.77.0/24)\n");
+	printf("\t       server side automatically get 10.66.77.1\n");
+	printf("\t       client side automatically get 10.66.77.2\n");
+	printf("\t-r [ip] - remote IP address\n");
+	printf("Example:\n");
+	printf("\tConnection between 111.222.10.20(server) <-> 190.190.30.10(client)\n");
+	printf("\tOn 111.222.10.20:\n");
+	printf("\t\t%s -s -n 10.10.10.0/30 -a 43123 -b 55412 -r 190.190.30.10\n", prog);
+	printf("\tOn 190.190.30.10:\n");
+	printf("\t\t%s -c -n 10.10.10.0/30 -a 43123 -b 55412 -r 111.222.10.20\n", prog);
+	exit(EXIT_SUCCESS);
+}
 
 ///////////////////////////////////////////////////////
 //////// MAIN
 ///////////////////////////////////////////////////////
 int main(int argc, char **argv) {
 	int ret = 0;
+	int opt = 0;
 
 	// NFQUEUE variables
 	uint16_t opt_queue_id = 69;
@@ -488,8 +516,6 @@ int main(int argc, char **argv) {
 	int udp_fd[UDP_OUTPORT_SIZE];
 	size_t udp_count[UDP_OUTPORT_SIZE];
 
-	char *optarg;
-
 	enum work_mode_en {
 		WORK_MODE_UNKNOWN = 0,
 		WORK_MODE_SERVER,
@@ -498,15 +524,111 @@ int main(int argc, char **argv) {
 
 	DYNAMIC_ARRAY_INIT(sess);
 
+
+	while ((opt = getopt(argc, argv, "hsca:b:n:r:")) != -1)
+	switch (opt) {
+		case 'h': print_help(argv[0]); break;
+
+		case 's': case 'c':
+			if (work_mode == WORK_MODE_UNKNOWN) {
+				work_mode = (opt == 'c' ? WORK_MODE_CLIENT : WORK_MODE_SERVER);
+			} else {
+				fprintf(stderr, "ERROR: You can't mixing server and client mode\n");
+				return 1;
+			}
+		break;
+
+		case 'a': case 'b': {
+			char *e;
+			int val = strtod(optarg, &e);
+			if (*e != '\0') {
+				fprintf(stderr, "ERROR: Can't parse port number %s\n", optarg);
+				return 1;
+			}
+			if (val < 1025 || val > 65535) {
+				fprintf(stderr, "ERROR: Wrong port number %d, must be in 1025-65535\n", val);
+				return 1;
+			}
+			if (opt == 'a') opt_start_port = val; else opt_end_port = val;
+		} break;
+
+		case 'n': { // tun subnet address
+			char ipnet[128];
+			char *s, *e;
+			if (snprintf(ipnet, sizeof(ipnet), "%s", optarg) >= sizeof(ipnet)) {
+				fprintf(stderr, "ERROR: Can't parse too long value of \"-n %s\"\n", optarg);
+				return 1;
+			}
+			s = strchr(ipnet, '/');
+			if (s) {
+				*s++ = '\0';
+				opt_subnet_prefix = strtod(s, &e);
+				if (*e != '\0') {
+					fprintf(stderr, "ERROR: Can't parse subnet prefix \"%s\" in %s\n", s, optarg);
+					return 1;
+				}
+				if (opt_subnet_prefix < 0 || opt_subnet_prefix > 30) {
+					fprintf(stderr, "ERROR: Wrong subnet prefix %d, can be 0..30\n", opt_subnet_prefix);
+					return 1;
+				}
+			}
+			if (!inet_pton(AF_INET, ipnet, &tun_ptp_subnet)) {
+				fprintf(stderr, "ERROR: Can't parse \"%s\" as point-to-point subnet\n", optarg);
+				return 1;
+			}
+			if ((ntohl(tun_ptp_subnet.s_addr) & (0xFFFFFFFF << (32 - opt_subnet_prefix))) != ntohl(tun_ptp_subnet.s_addr)) {
+				fprintf(stderr, "ERROR: Wrong network address %s for prefix /%d\n", inet_ntoa(tun_ptp_subnet), opt_subnet_prefix);
+				return 1;
+			}
+			opt_tun_ptp_subnet = 1;
+		} break;
+
+		case 'r': { // remote point IP
+			struct spray_session new = {0};
+			if (!inet_pton(AF_INET, optarg, &new.remote_ip)) {
+				fprintf(stderr, "ERROR: Can't parse \"%s\" as remote IP\n", optarg);
+				return 1;
+			}
+			DYNAMIC_ARRAY_PUSH(sess, new);
+		} break;
+	} // switch opt
+
 	if (0 != geteuid()) {
-		fprintf(stderr,"You can't run program under unprivileged user!\n"
-			"Use: sudo %s\n", argv[0]);
+		fprintf(stderr, "ERROR: You can't run program under unprivileged user!\n");
+		fprintf(stderr, "Use: sudo %s\n", argv[0]);
 		return 1;
 	}
 
-	if (!(ctx = EVP_CIPHER_CTX_new())) return 1;
-
 	if (!find_commands()) return 1;
+
+	if (!opt_tun_ptp_subnet) {
+		fprintf(stderr, "ERROR: unknown tun subnet (use -n)\n");
+		return 1;
+	}
+
+	if (opt_start_port == opt_end_port) {
+		fprintf(stderr, "ERROR: Start and End port are equal -a %d == -b %d\n", opt_start_port, opt_end_port);
+		return 1;
+	}
+
+	if (sess.count == 0) {
+		fprintf(stderr, "ERROR: No any remote IP address (use -r)\n");
+		return 1;
+	}
+
+	if (work_mode == WORK_MODE_UNKNOWN) {
+		fprintf(stderr, "ERROR: Unknown working mode, use -s for server or -c for client mode\n");
+		return 1;
+	}
+
+	if (opt_end_port < opt_start_port) {
+		opt_end_port ^= opt_start_port;
+		opt_start_port ^= opt_end_port;
+		opt_end_port ^= opt_start_port;
+	}
+	diapazon = opt_end_port - opt_start_port;
+
+	if (!(ctx = EVP_CIPHER_CTX_new())) return 1;
 
 	for (size_t i = 0; i < UDP_OUTPORT_SIZE; i++) {
 		if ((udp_fd[i] = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
@@ -515,32 +637,6 @@ int main(int argc, char **argv) {
 		}
 		udp_count[i] = 0;
 	}
-
-/////////////////////////
-// TODO parse options
-	optarg = "10.66.77.0";
-
-	if (!inet_pton(AF_INET, optarg, &tun_ptp_subnet)) {
-		fprintf(stderr,"Can't parse \"%s\" as point-to-point /30 subnet\n", optarg);
-		return 1;
-	};
-	work_mode = WORK_MODE_CLIENT;
-
-	opt_start_port = 40123;
-	opt_end_port = 53412;
-	diapazon = opt_end_port - opt_start_port;
-
-	optarg = "10.168.1.26";
-	struct spray_session new = {0};
-	if (!inet_pton(AF_INET, optarg, &new.remote_ip)) {
-		fprintf(stderr, "Can't parse \"%s\" remote IP\n", optarg);
-		return 1;
-	}
-	optarg = "remotesecret";
-	snprintf(new.secret, sizeof(new.secret), "%s", optarg);
-	DYNAMIC_ARRAY_PUSH(sess, new);
-
-/////////////////////////
 
 	// Prepare tun variables
 	// TODO use opt_tun_iface if defined and check it
@@ -573,8 +669,8 @@ int main(int argc, char **argv) {
 		remote_ptp_ip.s_addr += ntohl(1);
 	};
 
-	if (0 != run_command("%s address add %s/24 dev %s", ip_bin,
-		inet_ntoa(local_ptp_ip), conn.tun_name)
+	if (0 != run_command("%s address add %s/%d dev %s", ip_bin,
+		inet_ntoa(local_ptp_ip), opt_subnet_prefix, conn.tun_name)
 	) {
 		fprintf(stderr, "error set ip address on tun iface\n");
 		ret = 1;
