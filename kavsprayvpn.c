@@ -471,7 +471,10 @@ int main(int argc, char **argv) {
 	uint16_t opt_queue_id = 69;
 	uint32_t opt_queue_maxlen = 10000;
 	int opt_touch_iptables = 1;
-	int iptables_create_rule = 0;
+	int iptables_nfqueue_rule = 0;
+	int iptables_nat_rule = 0;
+	int iptables_forward1_rule = 0;
+	int iptables_forward2_rule = 0;
 
 	// Netfilter
 	struct nfq_handle *netfilter_h = NULL;
@@ -582,18 +585,64 @@ int main(int argc, char **argv) {
 	"%s -%s INPUT -p udp --dport %d:%d " \
 	"-j NFQUEUE --queue-bypass --queue-num %d 2> /dev/null"
 
+#define IPTABLES_NAT_TEMPLATE \
+	"%s -t nat -%s POSTROUTING ! -o %s -j MASQUERADE 2> /dev/null"
+
+#define IPTABLES_FORWARD1_TEMPLATE \
+	"%s -%s FORWARD ! -o %s -i %s -j ACCEPT 2> /dev/null"
+
+#define IPTABLES_FORWARD2_TEMPLATE \
+	"%s -%s FORWARD ! -i %s -o %s -j ACCEPT 2> /dev/null"
+
 	// Add iptables rule if it not present
 	if (opt_touch_iptables && iptables_bin) {
 		if (0 != run_command(IPTABLES_NFQUEUE_TEMPLATE, iptables_bin, "C",
 				     opt_start_port, opt_end_port, opt_queue_id)
 		) {
 			if (0 != run_command(IPTABLES_NFQUEUE_TEMPLATE, iptables_bin, "I",
-					     opt_start_port, opt_end_port, opt_queue_id)) {
+					     opt_start_port, opt_end_port, opt_queue_id)
+			) {
 				fprintf(stderr, "Error: Cannot create iptables rule\n");
 				ret = 1;
 				goto exit_tun_ip;
-			} else iptables_create_rule = 1;
+			} else iptables_nfqueue_rule = 1;
 		}
+
+		if (work_mode == WORK_MODE_SERVER) {
+			if (0 != run_command(IPTABLES_NAT_TEMPLATE, iptables_bin, "C", conn.tun_name)
+			) {
+				if (0 != run_command(IPTABLES_NAT_TEMPLATE, iptables_bin, "I", conn.tun_name)
+				) {
+					fprintf(stderr, "Error: Cannot create iptables rule\n");
+					ret = 1;
+					goto exit_iptables;
+				} else iptables_nat_rule = 1;
+			}
+
+			if (0 != run_command(IPTABLES_FORWARD1_TEMPLATE, iptables_bin, "C",
+					     conn.tun_name, conn.tun_name)
+			) {
+				if (0 != run_command(IPTABLES_FORWARD1_TEMPLATE, iptables_bin, "I",
+						     conn.tun_name, conn.tun_name)
+				) {
+					fprintf(stderr, "Error: Cannot create iptables rule\n");
+					ret = 1;
+					goto exit_iptables;
+				} else iptables_forward1_rule = 1;
+			}
+
+			if (0 != run_command(IPTABLES_FORWARD2_TEMPLATE, iptables_bin, "C",
+					     conn.tun_name, conn.tun_name)
+			) {
+				if (0 != run_command(IPTABLES_FORWARD2_TEMPLATE, iptables_bin, "I",
+						     conn.tun_name, conn.tun_name)
+				) {
+					fprintf(stderr, "Error: Cannot create iptables rule\n");
+					ret = 1;
+					goto exit_iptables;
+				} else iptables_forward2_rule = 1;
+			}
+		} // MODE_SERVER
 	}
 
 #ifdef PRODUCTION
@@ -677,7 +726,31 @@ exit:
 	if (netfilter_qh) nfq_destroy_queue(netfilter_qh);
 	if (netfilter_h) nfq_close(netfilter_h);
 
-	if (iptables_create_rule && iptables_bin) {
+exit_iptables:
+	if (iptables_forward2_rule && iptables_bin) {
+		if (0 != run_command(IPTABLES_FORWARD2_TEMPLATE, iptables_bin, "D",
+				     conn.tun_name, conn.tun_name)
+		) {
+			fprintf(stderr, "Error: Cannot delete iptables rule\n");
+		}
+	}
+
+	if (iptables_forward1_rule && iptables_bin) {
+		if (0 != run_command(IPTABLES_FORWARD1_TEMPLATE, iptables_bin, "D",
+				     conn.tun_name, conn.tun_name)
+		) {
+			fprintf(stderr, "Error: Cannot delete iptables rule\n");
+		}
+	}
+
+	if (iptables_nat_rule && iptables_bin) {
+		if (0 != run_command(IPTABLES_NAT_TEMPLATE, iptables_bin, "D", conn.tun_name)
+		) {
+			fprintf(stderr, "Error: Cannot delete iptables rule\n");
+		}
+	}
+
+	if (iptables_nfqueue_rule && iptables_bin) {
 		if (0 != run_command(IPTABLES_NFQUEUE_TEMPLATE, iptables_bin, "D",
 				     opt_start_port, opt_end_port, opt_queue_id)
 		) {
