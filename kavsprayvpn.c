@@ -144,25 +144,9 @@ struct spray_session {
 	} state;
 };
 
-const char *iptables_bin = NULL;
-const char *iptables_search[] = {
-	"/usr/local/sbin/iptables",
-	"/usr/local/bin/iptables",
-	"/usr/sbin/iptables",
-	"/usr/bin/iptables",
-	"/sbin/iptables",
-	"/usr/iptables",
-	NULL };
-
-const char *ip_bin = NULL;
-const char *ip_search[] = {
-	"/usr/local/sbin/ip",
-	"/usr/local/bin/ip",
-	"/usr/sbin/ip",
-	"/usr/bin/ip",
-	"/sbin/ip",
-	"/usr/ip",
-	NULL };
+// Path to command executables
+static char *iptables_bin = NULL;
+static char *ip_bin = NULL;
 
 DYNAMIC_ARRAY_DECLARE(struct spray_session, sess);
 
@@ -171,17 +155,28 @@ DYNAMIC_ARRAY_DECLARE(struct spray_session, sess);
 ///////////////////////////////////////////////////////
 
 bool find_commands() {
-	for (const char **t = iptables_search; *t; t++) {
-		if (0 == access(*t, R_OK | X_OK)) { iptables_bin = *t; break; }
+	char path[] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin";
+	char *p = path;
+	char *dir;
+	char cmd[PATH_MAX];
+
+	while ((dir = strsep(&p, ":")) != NULL) {
+		if (!iptables_bin) {
+			snprintf(cmd, sizeof(cmd), "%s/%s", dir, "iptables");
+			if (0 == access(cmd, R_OK | X_OK)) iptables_bin = strdup(cmd);
+		}
+		if (!ip_bin) {
+			snprintf(cmd, sizeof(cmd), "%s/%s", dir, "ip");
+			if (0 == access(cmd, R_OK | X_OK)) ip_bin = strdup(cmd);
+		}
+		if (iptables_bin && ip_bin) break;
 	}
+
 	if (!iptables_bin) {
 		fprintf(stderr,"Can't found 'iptables' executable !\n");
 		return false;
 	}
 
-	for (const char **t = ip_search; *t; t++) {
-		if (0 == access(*t, R_OK | X_OK)) { ip_bin = *t; break; }
-	}
 	if (!ip_bin) {
 		fprintf(stderr,"Can't found 'ip' executable !\n");
 		return false;
@@ -864,6 +859,9 @@ exit_tun_link:
 	run_command("%s link set %s down", ip_bin, conn.tun_name);
 
 exit_tun:
+	if (iptables_bin) free(iptables_bin);
+	if (ip_bin) free(ip_bin);
+
 	for (size_t i = 0; i < UDP_OUTPORT_SIZE; i++) {
 		if (udp_fd[i] > 0) close(udp_fd[i]);
 	}
