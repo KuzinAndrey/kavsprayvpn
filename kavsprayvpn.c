@@ -279,6 +279,8 @@ int decrypt_data(EVP_CIPHER_CTX *ctx, const char *data, size_t data_len,
 	if (!ctx || !data || !outdata || !outdata_len) return -1;
 	*outdata_len = 0;
 
+	if (data_len < (sizeof(key_pos) + sizeof(iv_pos))) return -1;
+
 	memcpy(&key_pos, data, sizeof(key_pos));
 	s += sizeof(key_pos);
 
