@@ -408,10 +408,6 @@ static int vpn_nfq_callback(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 	if (udp_port < opt_start_port || udp_port > opt_end_port) goto verdict;
 
 	DYNAMIC_ARRAY_FOREACH(sess, i, {
-		if (sess.data[i].remote_ip_ttl > 0 &&
-			sess.data[i].remote_ip_ttl <= nfq_tv.tv_sec) {
-			resolv_ip_by_name(NULL, &sess.data[i]);
-		}
 		if (sess.data[i].remote_ip.s_addr == in.s_addr) {
 			DEBUG("%ld: found session %d\n", nfq_tv.tv_sec, found_sess);
 			found_sess = i;
@@ -471,10 +467,6 @@ static ssize_t tun_handle_packet(int sock_fd, char *buf, size_t buf_len) {
 #endif
 		dest.sin_family = AF_INET;
 		dest.sin_port = htons(opt_start_port + rand() % diapazon);
-		if (sess.data[session].remote_ip_ttl > 0 &&
-			sess.data[session].remote_ip_ttl <= time(NULL)) {
-			resolv_ip_by_name(NULL, &sess.data[session]);
-		}
 		dest.sin_addr = sess.data[session].remote_ip;
 
 		if (encrypt_data(ctx, buf, buf_len, crypto_buffer, &payload_len) < 0) {
@@ -527,6 +519,30 @@ void print_help(const char *prog) {
 	exit(EXIT_SUCCESS);
 }
 
+void *remotehost_resolver(void *arg) {
+	(void) arg;
+	time_t next_check = time(NULL) + 1;
+
+	while (2 != program_state) {
+		time_t now = time(NULL);
+		time_t min_next = now + 60000;
+		if (now >= next_check) {
+			DYNAMIC_ARRAY_FOREACH(sess, i, {
+				if (sess.data[i].remote_ip_ttl > 0 &&
+					sess.data[i].remote_ip_ttl <= now) {
+					resolv_ip_by_name(NULL, &sess.data[i]);
+					if (min_next > sess.data[i].remote_ip_ttl)
+						min_next = sess.data[i].remote_ip_ttl;
+				}
+			});
+			next_check = min_next;
+		}
+		sleep(1);
+	}
+
+	pthread_exit(NULL);
+}
+
 ///////////////////////////////////////////////////////
 //////// MAIN
 ///////////////////////////////////////////////////////
@@ -548,6 +564,9 @@ int main(int argc, char **argv) {
 	struct nfnl_handle *netfilter_nh = NULL;
 	struct nfq_q_handle *netfilter_qh = NULL;
 	int netfilter_fd;
+
+	int resolver_pthread = 0;
+	pthread_t thread_id;
 
 	fd_set rfds;
 	struct timeval rfds_tv;
@@ -823,6 +842,17 @@ int main(int argc, char **argv) {
 		ret = 1; goto exit;
 	}
 
+	// Run DNS resolver thread to prevent packets freezing
+	opt = 0;
+	DYNAMIC_ARRAY_FOREACH(sess, i, {
+		if (sess.data[i].remote_ip_ttl > 0) opt++;
+	});
+	if (opt > 0) {
+		if (0 == pthread_create(&thread_id, NULL, remotehost_resolver, NULL)) {
+			resolver_pthread = 1;
+		}
+	}
+
 	signal(SIGINT, signal_handler);
 	signal(SIGTERM, signal_handler);
 
@@ -862,6 +892,7 @@ int main(int argc, char **argv) {
 		}
 	}
 
+	if (resolver_pthread) pthread_join(thread_id, NULL);
 exit:
 	if (netfilter_qh) nfq_destroy_queue(netfilter_qh);
 	if (netfilter_h) nfq_close(netfilter_h);

@@ -14,7 +14,7 @@ SOURCES = $(wildcard *.c)
 OBJS = $(patsubst %.c,%.o,$(SOURCES))
 LIBS =
 BUILD =
-CFLAGS = -Wall -Werror -pedantic
+CFLAGS = -Wall -Werror -pedantic -pthread
 
 ifdef DEBUG
   CFLAGS += -ggdb
