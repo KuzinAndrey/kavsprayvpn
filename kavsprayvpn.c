@@ -29,6 +29,8 @@ URL: https://www.github.com/KuzinAndrey/kavsprayvpn
 #include <net/if.h>
 #include <linux/if_tun.h>
 #include <arpa/inet.h>
+#include <resolv.h>
+#include <netdb.h>
 
 #include <inttypes.h>
 #include <arpa/inet.h>
@@ -134,6 +136,8 @@ static int opt_tun_ptp_subnet = 0;
 ///////////////////////////////////////////////////////
 struct spray_session {
 	struct in_addr remote_ip;
+	char remote_name[255];
+	time_t remote_ip_ttl;
 	char secret[128];
 	char session[1024];
 	time_t session_init;
@@ -208,6 +212,38 @@ defer:
 	if (com) free(com);
 	return ret;
 } // run_command()
+
+// Resolv hostname with TTL
+int resolv_ip_by_name(char *hostname, struct spray_session *s) {
+	unsigned char nsbuf[NS_PACKETSZ];
+	ns_msg msg;
+	ns_rr rr;
+	int len;
+	char *name = hostname;
+
+	if (!hostname) name = s->remote_name;
+
+	len = res_query(name, ns_c_in, ns_t_a, nsbuf, sizeof(nsbuf));
+	if (len < 0 || ns_initparse(nsbuf, len, &msg) < 0) goto error;
+
+	len = ns_msg_count(msg, ns_s_an);
+	for (int i = 0; i < len; i++) {
+		if (ns_parserr(&msg, ns_s_an, i, &rr) < 0) continue;
+		if (ns_rr_type(rr) != ns_t_a) continue;
+
+		memcpy(&s->remote_ip, ns_rr_rdata(rr), sizeof(struct in_addr));
+		s->remote_ip_ttl = time(NULL) + ns_rr_ttl(rr);
+		// TODO need support several IP ?
+		return 1;
+	}
+error:
+	// prevent resolving flood with expired ttl if current resolv failed
+	if (s->remote_ip_ttl > 0) {
+		s->remote_ip_ttl = time(NULL) + 60;
+	}
+
+	return 0;
+} // resolv_ip_by_name()
 
 ///////////////////////////////////////////////////////
 //////// ENCRYPTION
@@ -314,8 +350,8 @@ static int vpn_nfq_callback(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 	struct nfqnl_msg_packet_hdr *ph;
 	unsigned char *payload;
 	size_t payload_len;
-#ifndef PRODUCTION
 	struct timeval nfq_tv;
+#ifndef PRODUCTION
 	char ipaddr[128];
 #endif
 
@@ -331,12 +367,10 @@ static int vpn_nfq_callback(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 	ph = nfq_get_msg_packet_hdr(nfa);
 	id = ntohl(ph->packet_id);
 
-#ifndef PRODUCTION
 	if (0 != nfq_get_timestamp(nfa, &nfq_tv)) {
 		nfq_tv.tv_sec = time(NULL);
 		nfq_tv.tv_usec = 0;
 	}
-#endif
 
 	ret = nfq_get_payload(nfa, &payload);
 	if (ret <= 0 || !payload) goto verdict;
@@ -374,6 +408,10 @@ static int vpn_nfq_callback(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 	if (udp_port < opt_start_port || udp_port > opt_end_port) goto verdict;
 
 	DYNAMIC_ARRAY_FOREACH(sess, i, {
+		if (sess.data[i].remote_ip_ttl > 0 &&
+			sess.data[i].remote_ip_ttl <= nfq_tv.tv_sec) {
+			resolv_ip_by_name(NULL, &sess.data[i]);
+		}
 		if (sess.data[i].remote_ip.s_addr == in.s_addr) {
 			DEBUG("%ld: found session %d\n", nfq_tv.tv_sec, found_sess);
 			found_sess = i;
@@ -433,6 +471,10 @@ static ssize_t tun_handle_packet(int sock_fd, char *buf, size_t buf_len) {
 #endif
 		dest.sin_family = AF_INET;
 		dest.sin_port = htons(opt_start_port + rand() % diapazon);
+		if (sess.data[session].remote_ip_ttl > 0 &&
+			sess.data[session].remote_ip_ttl <= time(NULL)) {
+			resolv_ip_by_name(NULL, &sess.data[session]);
+		}
 		dest.sin_addr = sess.data[session].remote_ip;
 
 		if (encrypt_data(ctx, buf, buf_len, crypto_buffer, &payload_len) < 0) {
@@ -468,14 +510,14 @@ void print_help(const char *prog) {
 	printf("Options:\n");
 	printf("\t-h - this help\n");
 	printf("\t-s - work as server side (run iptables with NAT & FORWARD rules)\n");
-	printf("\t-c - work as client size\n");
+	printf("\t-c - work as client side\n");
 	printf("\t-a [port] - start UDP port diapazon\n");
 	printf("\t-b [port] - end UDP port diapazon\n");
 	printf("\t-n [subnet] - P-t-P subnet to set IP on tun iface (can be prefixed by /NN)\n");
 	printf("\t     Example: 10.66.77.0 (or 10.66.77.0/30 or 10.66.77.0/24)\n");
 	printf("\t       server side automatically get 10.66.77.1\n");
 	printf("\t       client side automatically get 10.66.77.2\n");
-	printf("\t-r [ip] - remote IP address\n");
+	printf("\t-r [ip/hostname] - remote IP address or hostname\n");
 	printf("Example:\n");
 	printf("\tConnection between 111.222.10.20(server) <-> 190.190.30.10(client)\n");
 	printf("\tOn 111.222.10.20:\n");
@@ -521,6 +563,7 @@ int main(int argc, char **argv) {
 
 	DYNAMIC_ARRAY_INIT(sess);
 
+	srand(time(NULL) ^ getpid());
 
 	while ((opt = getopt(argc, argv, "hsca:b:n:r:")) != -1)
 	switch (opt) {
@@ -580,11 +623,15 @@ int main(int argc, char **argv) {
 			opt_tun_ptp_subnet = 1;
 		} break;
 
-		case 'r': { // remote point IP
+		case 'r': { // remote point IP or hostname
 			struct spray_session new = {0};
 			if (!inet_pton(AF_INET, optarg, &new.remote_ip)) {
-				fprintf(stderr, "ERROR: Can't parse \"%s\" as remote IP\n", optarg);
-				return 1;
+				if (resolv_ip_by_name(optarg, &new)) {
+					snprintf(new.remote_name, sizeof(new.remote_name), "%s", optarg);
+				} else {
+					fprintf(stderr, "ERROR: Can't parse \"%s\" as remote IP or hostname\n", optarg);
+					return 1;
+				}
 			}
 			DYNAMIC_ARRAY_PUSH(sess, new);
 		} break;
@@ -609,7 +656,7 @@ int main(int argc, char **argv) {
 	}
 
 	if (sess.count == 0) {
-		fprintf(stderr, "ERROR: No any remote IP address (use -r)\n");
+		fprintf(stderr, "ERROR: No any remote points (use -r)\n");
 		return 1;
 	}
 

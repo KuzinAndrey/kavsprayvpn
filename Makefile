@@ -25,6 +25,7 @@ endif
 
 LIBS += -lnfnetlink -lnetfilter_queue
 LIBS += -lcrypto
+LIBS += -lresolv
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $<
