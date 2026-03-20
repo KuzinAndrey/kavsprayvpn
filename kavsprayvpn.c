@@ -25,6 +25,7 @@ URL: https://www.github.com/KuzinAndrey/kavsprayvpn
 #include <errno.h>
 #include <syslog.h>
 #include <time.h>
+#include <pthread.h>
 
 #include <net/if.h>
 #include <linux/if_tun.h>
@@ -65,6 +66,9 @@ uint16_t opt_end_port = 65535;
 uint16_t diapazon = 64510; // end - start
 size_t opt_change_port = 1000;
 int opt_subnet_prefix = 24;
+static unsigned char *crypto_array = crypto_h_array;
+static size_t crypto_array_size = CRYPTO_H_ARRAY_SIZE;
+int opt_external_crypto_array = 0;
 
 static char recv_buffer[0xFFFF] = {0};
 static char crypto_buffer[0xFFFF + 128] = {0};
@@ -250,8 +254,8 @@ error:
 ///////////////////////////////////////////////////////
 // Get portion of key data from built-in crypto array (see crypto.h)
 void get_crypto_array_part(size_t pos, void *buf, size_t buf_size) {
-	memcpy(buf, (char *)crypto_h_array + pos %
-		(CRYPTO_H_ARRAY_SIZE - buf_size + 1), buf_size);
+	memcpy(buf, (char *)crypto_array + pos %
+		(crypto_array_size - buf_size + 1), buf_size);
 }
 
 
@@ -510,6 +514,7 @@ void print_help(const char *prog) {
 	printf("\t       server side automatically get 10.66.77.1\n");
 	printf("\t       client side automatically get 10.66.77.2\n");
 	printf("\t-r [ip/hostname] - remote IP address or hostname\n");
+	printf("\t-k [file] - use crypto key from file\n");
 	printf("Example:\n");
 	printf("\tConnection between 111.222.10.20(server) <-> 190.190.30.10(client)\n");
 	printf("\tOn 111.222.10.20:\n");
@@ -584,7 +589,7 @@ int main(int argc, char **argv) {
 
 	srand(time(NULL) ^ getpid());
 
-	while ((opt = getopt(argc, argv, "hsca:b:n:r:")) != -1)
+	while ((opt = getopt(argc, argv, "hsca:b:n:r:k:")) != -1)
 	switch (opt) {
 		case 'h': print_help(argv[0]); break;
 
@@ -653,6 +658,30 @@ int main(int argc, char **argv) {
 				}
 			}
 			DYNAMIC_ARRAY_PUSH(sess, new);
+		} break;
+
+		case 'k': { // use crypto array from file
+			FILE *f = fopen(optarg, "rb");
+			if (!f) {
+				fprintf(stderr, "ERROR: Can't open file \"%s\" - %s\n", optarg, strerror(errno));
+				return 1;
+			}
+			fseek(f, 0L, SEEK_END);
+			crypto_array_size = ftell(f);
+			rewind(f);
+			crypto_array = malloc(crypto_array_size);
+			if (!crypto_array) {
+				fclose(f);
+				fprintf(stderr, "ERROR: Can't allocate memory for crypto array\n");
+				return 1;
+			} else opt_external_crypto_array = 1;
+			if (crypto_array_size != fread(crypto_array, 1, crypto_array_size, f)) {
+				fclose(f);
+				fprintf(stderr, "ERROR: Can't read crypto array from file \"%s\"\n", optarg);
+				free(crypto_array);
+				return 1;
+			}
+			fclose(f);
 		} break;
 	} // switch opt
 
@@ -946,5 +975,6 @@ exit_tun:
 	down_tun_iface(&conn);
 	if (ctx) EVP_CIPHER_CTX_free(ctx);
 	DYNAMIC_ARRAY_FREE(sess);
+	if (opt_external_crypto_array) free(crypto_array);
 	return ret;
 }
