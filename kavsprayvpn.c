@@ -73,6 +73,7 @@ int opt_external_crypto_array = 0;
 // Options for NFQUEUE
 uint16_t opt_queue_id = 69;
 uint32_t opt_queue_maxlen = 10000;
+static char remote_ip_source[135] = {0};
 
 static char recv_buffer[0xFFFF] = {0};
 static char crypto_buffer[0xFFFF + 128] = {0};
@@ -801,7 +802,6 @@ int main(int argc, char **argv) {
 
 	// Add iptables rule if it not present
 	if (opt_touch_iptables && iptables_bin) {
-		char remote_ip_source[135] = {0};
 		char remote_ipaddr[128] = {0};
 
 		// if remote point is IP (not name) and this is point-to-point connection
@@ -978,7 +978,7 @@ exit_iptables:
 
 	if (iptables_nfqueue_rule && iptables_bin) {
 		if (0 != run_command(IPTABLES_NFQUEUE_TEMPLATE, iptables_bin, "D",
-				     opt_start_port, opt_end_port, opt_queue_id)
+				     remote_ip_source, opt_start_port, opt_end_port, opt_queue_id)
 		) {
 			fprintf(stderr, "Error: Cannot delete iptables rule\n");
 		}
