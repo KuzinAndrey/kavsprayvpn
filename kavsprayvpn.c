@@ -70,6 +70,10 @@ static unsigned char *crypto_array = crypto_h_array;
 static size_t crypto_array_size = CRYPTO_H_ARRAY_SIZE;
 int opt_external_crypto_array = 0;
 
+// Options for NFQUEUE
+uint16_t opt_queue_id = 69;
+uint32_t opt_queue_maxlen = 10000;
+
 static char recv_buffer[0xFFFF] = {0};
 static char crypto_buffer[0xFFFF + 128] = {0};
 static EVP_CIPHER_CTX *ctx = NULL;
@@ -515,6 +519,7 @@ void print_help(const char *prog) {
 	printf("\t       client side automatically get 10.66.77.2\n");
 	printf("\t-r [ip/hostname] - remote IP address or hostname\n");
 	printf("\t-k [file] - use crypto key from file\n");
+	printf("\t-q [number] - nf_queue number (default %d)\n", opt_queue_id);
 	printf("Example:\n");
 	printf("\tConnection between 111.222.10.20(server) <-> 190.190.30.10(client)\n");
 	printf("\tOn 111.222.10.20:\n");
@@ -556,8 +561,6 @@ int main(int argc, char **argv) {
 	int opt = 0;
 
 	// NFQUEUE variables
-	uint16_t opt_queue_id = 69;
-	uint32_t opt_queue_maxlen = 10000;
 	int opt_touch_iptables = 1;
 	int iptables_nfqueue_rule = 0;
 	int iptables_nat_rule = 0;
@@ -589,7 +592,7 @@ int main(int argc, char **argv) {
 
 	srand(time(NULL) ^ getpid());
 
-	while ((opt = getopt(argc, argv, "hsca:b:n:r:k:")) != -1)
+	while ((opt = getopt(argc, argv, "hsca:b:n:r:k:q:")) != -1)
 	switch (opt) {
 		case 'h': print_help(argv[0]); break;
 
@@ -683,6 +686,20 @@ int main(int argc, char **argv) {
 			}
 			fclose(f);
 		} break;
+
+		case 'q': {
+			char *e;
+			int val = strtod(optarg, &e);
+			if (*e != '\0') {
+				fprintf(stderr, "ERROR: Can't parse nf_queue number %s\n", optarg);
+				return 1;
+			}
+			if (val < 1 || val > 65535) {
+				fprintf(stderr, "ERROR: Wrong nf_queue number %d, must be in 1-65535\n", val);
+				return 1;
+			}
+			opt_queue_id = val;
+		} break;
 	} // switch opt
 
 	if (0 != geteuid()) {
@@ -770,7 +787,7 @@ int main(int argc, char **argv) {
 	};
 
 #define IPTABLES_NFQUEUE_TEMPLATE \
-	"%s -%s INPUT -p udp --dport %d:%d " \
+	"%s -%s INPUT %s -p udp --dport %d:%d " \
 	"-j NFQUEUE --queue-bypass --queue-num %d 2> /dev/null"
 
 #define IPTABLES_NAT_TEMPLATE \
@@ -784,11 +801,20 @@ int main(int argc, char **argv) {
 
 	// Add iptables rule if it not present
 	if (opt_touch_iptables && iptables_bin) {
+		char remote_ip_source[135] = {0};
+		char remote_ipaddr[128] = {0};
+
+		// if remote point is IP (not name) and this is point-to-point connection
+		if (sess.count == 1 && strlen(sess.data[0].remote_name) == 0) {
+			if (inet_ntop(AF_INET, &sess.data[0].remote_ip, remote_ipaddr, sizeof(remote_ipaddr)))
+				snprintf(remote_ip_source, sizeof(remote_ip_source), "-s %s", remote_ipaddr);
+		}
+
 		if (0 != run_command(IPTABLES_NFQUEUE_TEMPLATE, iptables_bin, "C",
-				     opt_start_port, opt_end_port, opt_queue_id)
+				     remote_ip_source, opt_start_port, opt_end_port, opt_queue_id)
 		) {
 			if (0 != run_command(IPTABLES_NFQUEUE_TEMPLATE, iptables_bin, "I",
-					     opt_start_port, opt_end_port, opt_queue_id)
+					     remote_ip_source, opt_start_port, opt_end_port, opt_queue_id)
 			) {
 				fprintf(stderr, "Error: Cannot create iptables rule\n");
 				ret = 1;
