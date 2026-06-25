@@ -60,10 +60,10 @@ int program_state = 0; // 2 - exit
 int run_command(const char *fmt, ...);
 
 
-// Spray port diapazon
+// Spray port range
 uint16_t opt_start_port = 1025;
 uint16_t opt_end_port = 65535;
-uint16_t diapazon = 64510; // end - start
+uint16_t port_range = 64510; // end - start
 size_t opt_change_port = 1000;
 int opt_subnet_prefix = 24;
 static unsigned char *crypto_array = crypto_h_array;
@@ -444,7 +444,9 @@ verdict:
 }
 
 // Function for tun packet work
-static ssize_t tun_handle_packet(int sock_fd, char *buf, size_t buf_len) {
+static ssize_t tun_handle_packet(int sock_fd, uint16_t remote_port,
+	char *buf, size_t buf_len)
+{
 	struct ip *ip_packet;
 //	uint16_t ip_packet_len;
 	struct sockaddr_in dest = {0};
@@ -475,7 +477,7 @@ static ssize_t tun_handle_packet(int sock_fd, char *buf, size_t buf_len) {
 		}
 #endif
 		dest.sin_family = AF_INET;
-		dest.sin_port = htons(opt_start_port + rand() % diapazon);
+		dest.sin_port = remote_port;
 		dest.sin_addr = sess.data[session].remote_ip;
 
 		if (encrypt_data(ctx, buf, buf_len, crypto_buffer, &payload_len) < 0) {
@@ -512,8 +514,8 @@ void print_help(const char *prog) {
 	printf("\t-h - this help\n");
 	printf("\t-s - work as server side (run iptables with NAT & FORWARD rules)\n");
 	printf("\t-c - work as client side\n");
-	printf("\t-a [port] - start UDP port diapazon\n");
-	printf("\t-b [port] - end UDP port diapazon\n");
+	printf("\t-a [port] - start UDP port range\n");
+	printf("\t-b [port] - end UDP port range\n");
 	printf("\t-n [subnet] - P-t-P subnet to set IP on tun iface (can be prefixed by /NN)\n");
 	printf("\t     Example: 10.66.77.0 (or 10.66.77.0/30 or 10.66.77.0/24)\n");
 	printf("\t       server side automatically get 10.66.77.1\n");
@@ -581,6 +583,7 @@ int main(int argc, char **argv) {
 	struct timeval rfds_tv;
 
 	int udp_fd[UDP_OUTPORT_SIZE];
+	uint16_t udp_dport[UDP_OUTPORT_SIZE];
 	size_t udp_count[UDP_OUTPORT_SIZE];
 
 	enum work_mode_en {
@@ -736,7 +739,7 @@ int main(int argc, char **argv) {
 		opt_start_port ^= opt_end_port;
 		opt_end_port ^= opt_start_port;
 	}
-	diapazon = opt_end_port - opt_start_port;
+	port_range = opt_end_port - opt_start_port;
 
 	if (!(ctx = EVP_CIPHER_CTX_new())) return 1;
 
@@ -745,6 +748,7 @@ int main(int argc, char **argv) {
 			fprintf(stderr, "UDP socket creation error\n");
 			return 1;
 		}
+		udp_dport[i] = htons(opt_start_port + rand() % port_range);
 		udp_count[i] = 0;
 	}
 
@@ -932,7 +936,7 @@ int main(int argc, char **argv) {
 				recv_len = read(conn.tun_fd, recv_buffer, sizeof(recv_buffer));
 				if (recv_len >= 0) {
 					size_t rand_port = rand() % UDP_OUTPORT_SIZE;
-					tun_handle_packet(udp_fd[rand_port], recv_buffer, recv_len);
+					tun_handle_packet(udp_fd[rand_port], udp_dport[rand_port], recv_buffer, recv_len);
 					udp_count[rand_port]++;
 
 					// Change outgoing UDP port every opt_change_port packets
@@ -940,7 +944,10 @@ int main(int argc, char **argv) {
 						close(udp_fd[rand_port]);
 						if ((udp_fd[rand_port] = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
 							goto exit;
-						} else udp_count[rand_port] = 0;
+						} else {
+							udp_dport[rand_port] = htons(opt_start_port + rand() % port_range);
+							udp_count[rand_port] = 0;
+						}
 					}
 				}
 			}
