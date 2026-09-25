@@ -70,6 +70,10 @@ static unsigned char *crypto_array = crypto_h_array;
 static size_t crypto_array_size = CRYPTO_H_ARRAY_SIZE;
 int opt_external_crypto_array = 0;
 
+int opt_bind_source = 0;
+struct in_addr bind_address = {0};
+char *opt_bind_device = NULL;
+
 // Options for NFQUEUE
 uint16_t opt_queue_id = 69;
 uint32_t opt_queue_maxlen = 10000;
@@ -523,6 +527,8 @@ void print_help(const char *prog) {
 	printf("\t-r [ip/hostname] - remote IP address or hostname\n");
 	printf("\t-k [file] - use crypto key from file\n");
 	printf("\t-q [number] - nf_queue number (default %d)\n", opt_queue_id);
+	printf("\t-d [ifname] - bind source socket to device name\n");
+	printf("\t-i [ip] - bind source socket to IP address\n");
 	printf("Example:\n");
 	printf("\tConnection between 111.222.10.20(server) <-> 190.190.30.10(client)\n");
 	printf("\tOn 111.222.10.20:\n");
@@ -554,6 +560,35 @@ void *remotehost_resolver(void *arg) {
 	}
 
 	pthread_exit(NULL);
+}
+
+void set_source_device(int *sock) {
+	if (!opt_bind_device) return;
+	if (*sock <= 0) return;
+
+	if (setsockopt(*sock, SOL_SOCKET, SO_BINDTODEVICE,
+			opt_bind_device, strlen(opt_bind_device)) < 0) {
+		close(*sock);
+		*sock = -1;
+	}
+}
+
+void set_source_address(int *sock) {
+	struct sockaddr_in source_addr;
+
+	if (!opt_bind_source) return;
+	if (*sock <= 0) return;
+
+	memset(&source_addr, 0, sizeof(source_addr));
+	source_addr.sin_family = AF_INET;
+	source_addr.sin_addr = bind_address;
+	source_addr.sin_port = htons(0);
+
+	if (bind(*sock, (struct sockaddr *)&source_addr,
+		 sizeof(source_addr)) < 0) {
+		close(*sock);
+		*sock = -1;
+	}
 }
 
 ///////////////////////////////////////////////////////
@@ -596,7 +631,7 @@ int main(int argc, char **argv) {
 
 	srand(time(NULL) ^ getpid());
 
-	while ((opt = getopt(argc, argv, "hsca:b:n:r:k:q:")) != -1)
+	while ((opt = getopt(argc, argv, "hsca:b:n:r:k:q:d:i:")) != -1)
 	switch (opt) {
 		case 'h': print_help(argv[0]); break;
 
@@ -704,6 +739,37 @@ int main(int argc, char **argv) {
 			}
 			opt_queue_id = val;
 		} break;
+
+		case 'd': {
+			if (strlen(optarg) >= IFNAMSIZ) {
+				fprintf(stderr, "ERROR: Interface name \"%s\" is too long (max: %d chars)\n",
+					optarg, IFNAMSIZ - 1);
+				return 1;
+			}
+
+			if (!if_nametoindex(optarg)) {
+				if (errno == ENXIO) {
+					fprintf(stderr, "ERROR: Interface \"%s\" does not exist\n", optarg);
+				} else {
+					perror("Error resolving interface name");
+				}
+				return 1;
+			}
+
+			opt_bind_device = strdup(optarg);
+			if (!opt_bind_device) {
+				fprintf(stderr, "OOM: Can't save source interface name\n");
+				return 1;
+			}
+		} break;
+
+		case 'i': {
+			if (inet_aton(optarg, &bind_address) == 0) {
+				fprintf(stderr, "ERROR: Can't parse source IP \"%s\"\n", optarg);
+				return 1;
+			} else opt_bind_source = 1;
+		} break;
+
 	} // switch opt
 
 	if (0 != geteuid()) {
@@ -935,18 +1001,24 @@ int main(int argc, char **argv) {
 			if (FD_ISSET(conn.tun_fd, &rfds)) {
 				recv_len = read(conn.tun_fd, recv_buffer, sizeof(recv_buffer));
 				if (recv_len >= 0) {
-					size_t rand_port = rand() % UDP_OUTPORT_SIZE;
+					size_t rand_port;
+					do {
+						rand_port = rand() % UDP_OUTPORT_SIZE;
+					} while (udp_fd[rand_port] <= 0);
 					tun_handle_packet(udp_fd[rand_port], udp_dport[rand_port], recv_buffer, recv_len);
 					udp_count[rand_port]++;
 
 					// Change outgoing UDP port every opt_change_port packets
 					if (udp_count[rand_port] > opt_change_port) {
 						close(udp_fd[rand_port]);
+						udp_fd[rand_port] = -1;
 						if ((udp_fd[rand_port] = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
 							goto exit;
 						} else {
 							udp_dport[rand_port] = htons(opt_start_port + rand() % port_range);
 							udp_count[rand_port] = 0;
+							set_source_device(&udp_fd[rand_port]);
+							set_source_address(&udp_fd[rand_port]);
 						}
 					}
 				}
