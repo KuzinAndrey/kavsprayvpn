@@ -77,7 +77,16 @@ char *opt_bind_device = NULL;
 // Options for NFQUEUE
 uint16_t opt_queue_id = 69;
 uint32_t opt_queue_maxlen = 10000;
-static char remote_ip_source[135] = {0};
+static int opt_nat_forward_rules = 1; // default on for server
+
+// Addon iptables options for NFQUEUE rule command
+// such as:
+// - "-s <ip>"(remote IP)
+// - "-d <ip>" (local bind IP)
+// - "-i <iface>" (local bind iface)
+static char addon_nfqueue_str[1024] = {0};
+static char *addon_nfqueue_str_p = &addon_nfqueue_str[0];
+static size_t addon_nfqueue_str_l = sizeof(addon_nfqueue_str);
 
 static char recv_buffer[0xFFFF] = {0};
 static char crypto_buffer[0xFFFF + 128] = {0};
@@ -517,6 +526,7 @@ void print_help(const char *prog) {
 	printf("Options:\n");
 	printf("\t-h - this help\n");
 	printf("\t-s - work as server side (run iptables with NAT & FORWARD rules)\n");
+	printf("\t\t-w - don't use NAT & FORWARD rules for server\n");
 	printf("\t-c - work as client side\n");
 	printf("\t-a [port] - start UDP port range\n");
 	printf("\t-b [port] - end UDP port range\n");
@@ -631,7 +641,7 @@ int main(int argc, char **argv) {
 
 	srand(time(NULL) ^ getpid());
 
-	while ((opt = getopt(argc, argv, "hsca:b:n:r:k:q:d:i:")) != -1)
+	while ((opt = getopt(argc, argv, "hswca:b:n:r:k:q:d:i:")) != -1)
 	switch (opt) {
 		case 'h': print_help(argv[0]); break;
 
@@ -642,6 +652,10 @@ int main(int argc, char **argv) {
 				fprintf(stderr, "ERROR: You can't mixing server and client mode\n");
 				return 1;
 			}
+		break;
+
+		case 'w':
+			opt_nat_forward_rules = 0;
 		break;
 
 		case 'a': case 'b': {
@@ -872,19 +886,54 @@ int main(int argc, char **argv) {
 
 	// Add iptables rule if it not present
 	if (opt_touch_iptables && iptables_bin) {
-		char remote_ipaddr[128] = {0};
+		int spr;
+		char ipaddr_str[INET6_ADDRSTRLEN] = {0};
 
 		// if remote point is IP (not name) and this is point-to-point connection
 		if (sess.count == 1 && strlen(sess.data[0].remote_name) == 0) {
-			if (inet_ntop(AF_INET, &sess.data[0].remote_ip, remote_ipaddr, sizeof(remote_ipaddr)))
-				snprintf(remote_ip_source, sizeof(remote_ip_source), "-s %s", remote_ipaddr);
+			if (inet_ntop(AF_INET, &sess.data[0].remote_ip, ipaddr_str, sizeof(ipaddr_str))) {
+				spr = snprintf(addon_nfqueue_str_p, addon_nfqueue_str_l, "-s %s ", ipaddr_str);
+				if (spr < addon_nfqueue_str_l) {
+					addon_nfqueue_str_p += spr;
+					addon_nfqueue_str_l -= spr;
+				} else {
+					*addon_nfqueue_str_p = '\0';
+					fprintf(stderr,"remote IP address overflow");
+				}
+			}
+		}
+
+		// if set bind IP (check for dest IP)
+		if (opt_bind_source) {
+			if (inet_ntop(AF_INET, &bind_address, ipaddr_str, sizeof(ipaddr_str))) {
+				spr = snprintf(addon_nfqueue_str_p, addon_nfqueue_str_l, "-d %s ", ipaddr_str);
+				if (spr < addon_nfqueue_str_l) {
+					addon_nfqueue_str_p += spr;
+					addon_nfqueue_str_l -= spr;
+				} else {
+					*addon_nfqueue_str_p = '\0';
+					fprintf(stderr,"local IP address overflow");
+				}
+			}
+		}
+
+		// if set bind device name (check for in interface)
+		if (opt_bind_device) {
+			spr = snprintf(addon_nfqueue_str_p, addon_nfqueue_str_l, "-i %s ", opt_bind_device);
+			if (spr < addon_nfqueue_str_l) {
+				addon_nfqueue_str_p += spr;
+				addon_nfqueue_str_l -= spr;
+			} else {
+				*addon_nfqueue_str_p = '\0';
+				fprintf(stderr,"input device name overflow");
+			}
 		}
 
 		if (0 != run_command(IPTABLES_NFQUEUE_TEMPLATE, iptables_bin, "C",
-				     remote_ip_source, opt_start_port, opt_end_port, opt_queue_id)
+				     addon_nfqueue_str, opt_start_port, opt_end_port, opt_queue_id)
 		) {
 			if (0 != run_command(IPTABLES_NFQUEUE_TEMPLATE, iptables_bin, "I",
-					     remote_ip_source, opt_start_port, opt_end_port, opt_queue_id)
+					     addon_nfqueue_str, opt_start_port, opt_end_port, opt_queue_id)
 			) {
 				fprintf(stderr, "Error: Cannot create iptables rule\n");
 				ret = 1;
@@ -892,7 +941,7 @@ int main(int argc, char **argv) {
 			} else iptables_nfqueue_rule = 1;
 		}
 
-		if (work_mode == WORK_MODE_SERVER) {
+		if (work_mode == WORK_MODE_SERVER && opt_nat_forward_rules) {
 			if (0 != run_command(IPTABLES_NAT_TEMPLATE, iptables_bin, "C", conn.tun_name)
 			) {
 				if (0 != run_command(IPTABLES_NAT_TEMPLATE, iptables_bin, "I", conn.tun_name)
@@ -1057,7 +1106,7 @@ exit_iptables:
 
 	if (iptables_nfqueue_rule && iptables_bin) {
 		if (0 != run_command(IPTABLES_NFQUEUE_TEMPLATE, iptables_bin, "D",
-				     remote_ip_source, opt_start_port, opt_end_port, opt_queue_id)
+				     addon_nfqueue_str, opt_start_port, opt_end_port, opt_queue_id)
 		) {
 			fprintf(stderr, "Error: Cannot delete iptables rule\n");
 		}
