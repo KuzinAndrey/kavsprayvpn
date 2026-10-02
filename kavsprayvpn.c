@@ -572,22 +572,24 @@ void *remotehost_resolver(void *arg) {
 	pthread_exit(NULL);
 }
 
-void set_source_device(int *sock) {
-	if (!opt_bind_device) return;
-	if (*sock <= 0) return;
+int set_source_device(int *sock) {
+	if (!opt_bind_device) return 0;
+	if (*sock <= 0) return 0;
 
 	if (setsockopt(*sock, SOL_SOCKET, SO_BINDTODEVICE,
 			opt_bind_device, strlen(opt_bind_device)) < 0) {
 		close(*sock);
 		*sock = -1;
+		return -errno;
 	}
+	return 0;
 }
 
-void set_source_address(int *sock) {
+int set_source_address(int *sock) {
 	struct sockaddr_in source_addr;
 
-	if (!opt_bind_source) return;
-	if (*sock <= 0) return;
+	if (!opt_bind_source) return 0;
+	if (*sock <= 0) return 0;
 
 	memset(&source_addr, 0, sizeof(source_addr));
 	source_addr.sin_family = AF_INET;
@@ -598,7 +600,9 @@ void set_source_address(int *sock) {
 		 sizeof(source_addr)) < 0) {
 		close(*sock);
 		*sock = -1;
+		return -errno;
 	}
+	return 0;
 }
 
 ///////////////////////////////////////////////////////
@@ -1064,10 +1068,20 @@ int main(int argc, char **argv) {
 						if ((udp_fd[rand_port] = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
 							goto exit;
 						} else {
+							int br;
 							udp_dport[rand_port] = htons(opt_start_port + rand() % port_range);
 							udp_count[rand_port] = 0;
-							set_source_device(&udp_fd[rand_port]);
-							set_source_address(&udp_fd[rand_port]);
+							br = set_source_device(&udp_fd[rand_port]);
+							if (br < 0) {
+								syslog(LOG_ERR, "Can't bind %d socket to device %s - %d (%s)",
+									udp_fd[rand_port], opt_bind_device ? opt_bind_device : "none",
+									br, br == -1 ? "none" : strerror(-br));
+							}
+							br = set_source_address(&udp_fd[rand_port]);
+							if (br < 0) {
+								syslog(LOG_ERR, "Can't bind %d socket to source IP - %d (%s)",
+									udp_fd[rand_port], br, br == -1 ? "none" : strerror(-br));
+							}
 						}
 					}
 				}
