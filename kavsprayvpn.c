@@ -605,6 +605,21 @@ int set_source_address(int *sock) {
 	return 0;
 }
 
+void bind_all_sources(int *sock) {
+	int br;
+	br = set_source_device(sock);
+	if (br < 0) {
+		syslog(LOG_ERR, "Can't bind %d socket to device %s - %d (%s)",
+			*sock, opt_bind_device ? opt_bind_device : "none",
+			br, br == -1 ? "none" : strerror(-br));
+	}
+	br = set_source_address(sock);
+	if (br < 0) {
+		syslog(LOG_ERR, "Can't bind %d socket to source IP - %d (%s)",
+			*sock, br, br == -1 ? "none" : strerror(-br));
+	}
+}
+
 ///////////////////////////////////////////////////////
 //////// MAIN
 ///////////////////////////////////////////////////////
@@ -834,6 +849,7 @@ int main(int argc, char **argv) {
 		}
 		udp_dport[i] = htons(opt_start_port + rand() % port_range);
 		udp_count[i] = 0;
+		bind_all_sources(&udp_fd[i]);
 	}
 
 	// Prepare tun variables
@@ -1068,20 +1084,9 @@ int main(int argc, char **argv) {
 						if ((udp_fd[rand_port] = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
 							goto exit;
 						} else {
-							int br;
 							udp_dport[rand_port] = htons(opt_start_port + rand() % port_range);
 							udp_count[rand_port] = 0;
-							br = set_source_device(&udp_fd[rand_port]);
-							if (br < 0) {
-								syslog(LOG_ERR, "Can't bind %d socket to device %s - %d (%s)",
-									udp_fd[rand_port], opt_bind_device ? opt_bind_device : "none",
-									br, br == -1 ? "none" : strerror(-br));
-							}
-							br = set_source_address(&udp_fd[rand_port]);
-							if (br < 0) {
-								syslog(LOG_ERR, "Can't bind %d socket to source IP - %d (%s)",
-									udp_fd[rand_port], br, br == -1 ? "none" : strerror(-br));
-							}
+							bind_all_sources(&udp_fd[rand_port]);
 						}
 					}
 				}
